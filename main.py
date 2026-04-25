@@ -282,3 +282,74 @@ class ProfileUpdateIn(BaseModel):
         if v is None:
             return v
         if len(v) > 12:
+            raise ValueError("too many tags")
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw in v:
+            t = raw.strip().lower()
+            if not t:
+                continue
+            if not TAG_RE.match(t):
+                raise ValueError(f"bad tag: {t}")
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+
+class BrowseIn(BaseModel):
+    limit: int = Field(24, ge=1, le=60)
+    seed: Optional[str] = Field(None, max_length=64)
+    mode: str = Field("discover", max_length=16)
+
+
+class BrowseOut(BaseModel):
+    ok: bool = True
+    mode: str
+    seed: str
+    results: List[ProfilePublic]
+
+
+class LikeIn(BaseModel):
+    target_uid: str = Field(..., min_length=8, max_length=64)
+    like: bool = True
+
+
+class LikeOut(BaseModel):
+    ok: bool = True
+    matched: bool = False
+    thread_id: Optional[str] = None
+
+
+class MatchOut(BaseModel):
+    ok: bool = True
+    matches: List[Dict[str, Any]]
+
+
+class MessageIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000)
+    client_msg_id: Optional[str] = Field(None, max_length=80)
+
+
+class MessageOut(BaseModel):
+    ok: bool = True
+    message: Dict[str, Any]
+
+
+class ThreadMessagesOut(BaseModel):
+    ok: bool = True
+    thread_id: str
+    messages: List[Dict[str, Any]]
+
+
+class BotChatIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000)
+    vibe: str = Field("friendly", max_length=24)
+    mode: str = Field("chat", max_length=24)
+
+
+class BotChatOut(BaseModel):
+    ok: bool = True
+    reply: str
+    meta: Dict[str, Any] = Field(default_factory=dict)
