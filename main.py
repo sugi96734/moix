@@ -495,3 +495,74 @@ async def db_connect() -> aiosqlite.Connection:
 
 class RateLimiter:
     def __init__(self, per_minute: int = 20, burst: int = 40):
+        self.per_minute = per_minute
+        self.burst = burst
+
+    async def consume(self, db: aiosqlite.Connection, uid: str, cost: int = 1) -> None:
+        cost = clamp_int(cost, 1, self.burst)
+        now = unix_ts()
+        row = await db.execute_fetchone("SELECT bucket, updated_at FROM rate_limits WHERE uid=?", (uid,))
+        if row is None:
+            bucket = cost
+            updated_at = now
+            await db.execute("INSERT INTO rate_limits(uid, bucket, updated_at) VALUES(?,?,?)", (uid, bucket, updated_at))
+            return
+        bucket = int(row["bucket"])
+        updated_at = int(row["updated_at"])
+        dt = max(0, now - updated_at)
+        recover = int((dt * self.per_minute) / 60)
+        bucket = max(0, bucket - recover)
+        if bucket + cost > self.burst:
+            raise http_error(429, "rate.limited", "Slow down")
+        bucket += cost
+        await db.execute("UPDATE rate_limits SET bucket=?, updated_at=? WHERE uid=?", (bucket, now, uid))
+
+
+RATE = RateLimiter(per_minute=22, burst=44)
+
+
+# ============================================================
+# Presence / WS hub
+# ============================================================
+
+
+@dataclass
+class WsConn:
+    uid: str
+    thread_id: str
+    ws: WebSocket
+    connected_at: int
+    last_seen_at: int
+
+
+class WsHub:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._by_thread: Dict[str, Set[WsConn]] = {}
+
+    async def add(self, conn: WsConn) -> None:
+        async with self._lock:
+            s = self._by_thread.setdefault(conn.thread_id, set())
+            s.add(conn)
+
+    async def remove(self, conn: WsConn) -> None:
+        async with self._lock:
+            s = self._by_thread.get(conn.thread_id)
+            if not s:
+                return
+            s.discard(conn)
+            if not s:
+                self._by_thread.pop(conn.thread_id, None)
+
+    async def broadcast(self, thread_id: str, payload: dict) -> None:
+        async with self._lock:
+            conns = list(self._by_thread.get(thread_id, set()))
+        if not conns:
+            return
+        txt = json.dumps(payload, separators=(",", ":"))
+        for c in conns:
+            try:
+                await c.ws.send_text(txt)
+            except Exception:
+                # best-effort; stale conns are cleaned on disconnect handler
+                pass
