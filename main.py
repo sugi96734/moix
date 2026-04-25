@@ -211,3 +211,74 @@ class RegisterIn(BaseModel):
         v = v.strip().lower()
         if not HANDLE_RE.match(v):
             raise ValueError("invalid handle")
+        if ".." in v or v.startswith(".") or v.endswith("."):
+            raise ValueError("invalid handle")
+        return v
+
+
+class LoginIn(BaseModel):
+    handle: str = Field(..., min_length=3, max_length=24)
+    password: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("handle")
+    @classmethod
+    def _norm(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not HANDLE_RE.match(v):
+            raise ValueError("invalid handle")
+        return v
+
+
+class AuthOut(BaseModel):
+    ok: bool = True
+    token: str
+    uid: str
+    handle: str
+    expires_at: int
+
+
+class ProfilePublic(BaseModel):
+    uid: str
+    handle: str
+    bio: str = ""
+    avatar: str = ""
+    country: str = ""
+    age: int = 0
+    prefs: Dict[str, Any] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)
+    updated_at: int = 0
+
+
+class ProfileMe(ProfilePublic):
+    email_hint: str = ""
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProfileUpdateIn(BaseModel):
+    bio: Optional[str] = Field(None, max_length=240)
+    avatar: Optional[str] = Field(None, max_length=512)
+    country: Optional[str] = Field(None, max_length=2)
+    age: Optional[int] = Field(None, ge=0, le=120)
+    prefs: Optional[Dict[str, Any]] = None
+    tags: Optional[List[str]] = None
+    settings: Optional[Dict[str, Any]] = None
+    email_hint: Optional[str] = Field(None, max_length=120)
+
+    @field_validator("country")
+    @classmethod
+    def _country(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if not v:
+            return ""
+        if len(v) != 2 or not v.isalpha():
+            raise ValueError("invalid country")
+        return v
+
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return v
+        if len(v) > 12:
