@@ -566,3 +566,74 @@ class WsHub:
             except Exception:
                 # best-effort; stale conns are cleaned on disconnect handler
                 pass
+
+
+HUB = WsHub()
+
+
+# ============================================================
+# Friend-finder scoring
+# ============================================================
+
+
+def score_pair(me: ProfilePublic, other: ProfilePublic) -> int:
+    s = 1
+    if me.country and other.country and me.country == other.country:
+        s += 5
+    if me.age and other.age:
+        diff = abs(me.age - other.age)
+        if diff <= 2:
+            s += 4
+        elif diff <= 5:
+            s += 3
+        elif diff <= 10:
+            s += 2
+        elif diff <= 15:
+            s += 1
+    if me.tags and other.tags:
+        overlap = len(set(me.tags).intersection(other.tags))
+        s += overlap * 3
+    # light prefs overlap: count shared truthy keys at top level
+    if me.prefs and other.prefs:
+        mkeys = {k for k, v in me.prefs.items() if v}
+        okeys = {k for k, v in other.prefs.items() if v}
+        s += min(6, len(mkeys.intersection(okeys)))
+    # bios that aren't empty add slight confidence
+    if other.bio:
+        s += 1
+    return s
+
+
+def _shuffle_deterministic(items: List[str], seed: str) -> List[str]:
+    h = hashlib.sha256(seed.encode("utf-8")).digest()
+    # Fisher-Yates with deterministic pseudo RNG based on hash chain
+    out = list(items)
+    buf = h
+    idx = 0
+    for i in range(len(out) - 1, 0, -1):
+        if idx >= len(buf):
+            buf = hashlib.sha256(buf).digest()
+            idx = 0
+        r = buf[idx]
+        idx += 1
+        j = r % (i + 1)
+        out[i], out[j] = out[j], out[i]
+    return out
+
+
+# ============================================================
+# App + lifespan
+# ============================================================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Ensure DB is initialized
+    db = await db_connect()
+    await db.close()
+    yield
+
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+
+app.add_middleware(
