@@ -69,3 +69,74 @@ AUTH_SECRET = _load_secret()
 _cors = os.environ.get("MOIX_CORS_ORIGINS", "*").split(",")
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def unix_ts() -> int:
+    return int(time.time())
+
+
+def clamp_int(v: int, lo: int, hi: int) -> int:
+    return lo if v < lo else hi if v > hi else v
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def stable_hash(text: str) -> str:
+    # Stable "content hash" used for idempotency keys and simple pointers.
+    return sha256_hex(text.encode("utf-8"))
+
+
+HANDLE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_.]{1,22}[a-z0-9])?$")
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,17}$")
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, message: str, details: Optional[dict] = None):
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details or {}
+        super().__init__(message)
+
+
+def http_error(status: int, code: str, message: str, details: Optional[dict] = None) -> HTTPException:
+    return HTTPException(status_code=status, detail={"ok": False, "code": code, "message": message, "details": details or {}})
+
+
+def ensure(condition: bool, status: int, code: str, message: str, details: Optional[dict] = None) -> None:
+    if not condition:
+        raise http_error(status, code, message, details)
+
+
+# ============================================================
+# Auth: signed token (HMAC-SHA256) with expiry and nonce
+# ============================================================
+
+
+@dataclass(frozen=True)
+class TokenClaims:
+    uid: str
+    exp: int
+    nonce: str
+    ver: int = 1
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _b64u_decode(s: str) -> bytes:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
+
+
+def sign_token(uid: str, ttl_seconds: int = 3600 * 24 * 7) -> str:
+    now = unix_ts()
+    exp = now + ttl_seconds
+    nonce = secrets.token_urlsafe(16)
+    payload = {"ver": 1, "uid": uid, "exp": exp, "nonce": nonce}
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
