@@ -353,3 +353,74 @@ class BotChatOut(BaseModel):
     ok: bool = True
     reply: str
     meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReportIn(BaseModel):
+    accused_uid: str = Field(..., min_length=8, max_length=64)
+    reason: str = Field(..., min_length=2, max_length=48)
+    note: Optional[str] = Field(None, max_length=64)
+
+
+class ReportOut(BaseModel):
+    ok: bool = True
+    report_id: int
+
+
+# ============================================================
+# DB schema + helpers
+# ============================================================
+
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS users (
+    uid TEXT PRIMARY KEY,
+    handle TEXT UNIQUE NOT NULL,
+    pass_salt TEXT NOT NULL,
+    pass_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_login_at INTEGER NOT NULL DEFAULT 0,
+    disabled INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    uid TEXT PRIMARY KEY REFERENCES users(uid) ON DELETE CASCADE,
+    bio TEXT NOT NULL DEFAULT '',
+    avatar TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '',
+    age INTEGER NOT NULL DEFAULT 0,
+    prefs_json TEXT NOT NULL DEFAULT '{}',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    email_hint TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    src_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    dst_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (src_uid, dst_uid, kind)
+);
+
+CREATE TABLE IF NOT EXISTS threads (
+    thread_id TEXT PRIMARY KEY,
+    a_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    b_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    last_msg_at INTEGER NOT NULL DEFAULT 0,
+    meta_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_threads_a ON threads(a_uid);
+CREATE INDEX IF NOT EXISTS idx_threads_b ON threads(b_uid);
+
+CREATE TABLE IF NOT EXISTS messages (
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    from_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
