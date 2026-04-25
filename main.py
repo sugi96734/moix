@@ -708,3 +708,74 @@ async def get_db() -> aiosqlite.Connection:
     finally:
         await db.close()
 
+
+# ============================================================
+# User + profile helpers
+# ============================================================
+
+
+async def fetch_user_by_handle(db: aiosqlite.Connection, handle: str) -> Optional[aiosqlite.Row]:
+    return await db.execute_fetchone("SELECT * FROM users WHERE handle=?", (handle,))
+
+
+async def fetch_user_by_uid(db: aiosqlite.Connection, uid: str) -> Optional[aiosqlite.Row]:
+    return await db.execute_fetchone("SELECT * FROM users WHERE uid=?", (uid,))
+
+
+async def fetch_profile_row(db: aiosqlite.Connection, uid: str) -> Optional[aiosqlite.Row]:
+    return await db.execute_fetchone("SELECT * FROM profiles WHERE uid=?", (uid,))
+
+
+async def to_public_profile(db: aiosqlite.Connection, uid: str) -> ProfilePublic:
+    u = await fetch_user_by_uid(db, uid)
+    ensure(u is not None, 404, "user.not_found", "User not found")
+    p = await fetch_profile_row(db, uid)
+    if p is None:
+        # should exist for all users; still handle gracefully
+        prefs = {}
+        tags = []
+        settings = {}
+        email_hint = ""
+        bio = ""
+        avatar = ""
+        country = ""
+        age = 0
+        updated_at = 0
+    else:
+        prefs = safe_json_loads(p["prefs_json"], {})
+        tags = safe_json_loads(p["tags_json"], [])
+        settings = safe_json_loads(p["settings_json"], {})
+        email_hint = p["email_hint"]
+        bio = p["bio"]
+        avatar = p["avatar"]
+        country = p["country"]
+        age = int(p["age"])
+        updated_at = int(p["updated_at"])
+
+    return ProfilePublic(
+        uid=uid,
+        handle=u["handle"],
+        bio=bio,
+        avatar=avatar,
+        country=country,
+        age=age,
+        prefs=prefs if isinstance(prefs, dict) else {},
+        tags=tags if isinstance(tags, list) else [],
+        updated_at=updated_at,
+    )
+
+
+async def ensure_not_disabled(urow: aiosqlite.Row) -> None:
+    if int(urow["disabled"]) != 0:
+        raise http_error(403, "user.disabled", "Account disabled")
+
+
+# ============================================================
+# Auth endpoints
+# ============================================================
+
+
+@app.post("/api/register", response_model=AuthOut)
+async def register(body: RegisterIn, db: aiosqlite.Connection = Depends(get_db)) -> AuthOut:
+    handle = body.handle.strip().lower()
+    ensure(HANDLE_RE.match(handle) is not None, 400, "handle.invalid", "Invalid handle")
