@@ -140,3 +140,74 @@ def sign_token(uid: str, ttl_seconds: int = 3600 * 24 * 7) -> str:
     nonce = secrets.token_urlsafe(16)
     payload = {"ver": 1, "uid": uid, "exp": exp, "nonce": nonce}
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(AUTH_SECRET, body, hashlib.sha256).digest()
+    return _b64u(body) + "." + _b64u(sig)
+
+
+def verify_token(token: str) -> TokenClaims:
+    try:
+        body_b64, sig_b64 = token.split(".", 1)
+    except ValueError:
+        raise ApiError(401, "auth.bad_token", "Invalid token format")
+    try:
+        body = _b64u_decode(body_b64)
+        sig = _b64u_decode(sig_b64)
+    except Exception:
+        raise ApiError(401, "auth.bad_token", "Invalid token encoding")
+    want = hmac.new(AUTH_SECRET, body, hashlib.sha256).digest()
+    if not hmac.compare_digest(want, sig):
+        raise ApiError(401, "auth.bad_token", "Signature mismatch")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise ApiError(401, "auth.bad_token", "Invalid token payload")
+
+    ver = int(payload.get("ver", 0))
+    uid = str(payload.get("uid", ""))
+    exp = int(payload.get("exp", 0))
+    nonce = str(payload.get("nonce", ""))
+    if ver != 1 or not uid or exp <= 0 or not nonce:
+        raise ApiError(401, "auth.bad_token", "Malformed token claims")
+    if unix_ts() >= exp:
+        raise ApiError(401, "auth.expired", "Token expired")
+    return TokenClaims(uid=uid, exp=exp, nonce=nonce, ver=ver)
+
+
+async def get_auth_user(request: Request) -> "UserCtx":
+    hdr = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not hdr.startswith("Bearer "):
+        raise http_error(401, "auth.missing", "Missing Bearer token")
+    token = hdr[len("Bearer ") :].strip()
+    try:
+        claims = verify_token(token)
+    except ApiError as e:
+        raise http_error(e.status, e.code, e.message, e.details)
+    return UserCtx(uid=claims.uid, token_nonce=claims.nonce, token_exp=claims.exp)
+
+
+@dataclass(frozen=True)
+class UserCtx:
+    uid: str
+    token_nonce: str
+    token_exp: int
+
+
+# ============================================================
+# Pydantic models
+# ============================================================
+
+
+class Ok(BaseModel):
+    ok: bool = True
+
+
+class RegisterIn(BaseModel):
+    handle: str = Field(..., min_length=3, max_length=24)
+    password: str = Field(..., min_length=8, max_length=128)
+
+    @field_validator("handle")
+    @classmethod
+    def _valid_handle(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not HANDLE_RE.match(v):
+            raise ValueError("invalid handle")
