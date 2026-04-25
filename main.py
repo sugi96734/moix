@@ -424,3 +424,74 @@ CREATE TABLE IF NOT EXISTS messages (
     thread_id TEXT NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     from_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    client_msg_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (thread_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_thread_at ON messages(thread_id, at);
+
+CREATE TABLE IF NOT EXISTS reports (
+    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    accused_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+    uid TEXT PRIMARY KEY REFERENCES users(uid) ON DELETE CASCADE,
+    bucket INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"""
+
+
+def derive_uid(handle: str) -> str:
+    # Friendly stable UID: not meant to be secret. Includes a short random suffix to
+    # avoid predictability across users with similar handles.
+    core = stable_hash(handle)[:16]
+    suf = secrets.token_hex(4)
+    return f"u_{core}_{suf}"
+
+
+def password_hash(password: str, salt_b64: str) -> str:
+    salt = base64.urlsafe_b64decode((salt_b64 + "===").encode("utf-8"))
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 180_000, dklen=32)
+    return _b64u(dk)
+
+
+def new_password_salt() -> str:
+    return _b64u(secrets.token_bytes(18))
+
+
+def deterministic_thread_id(a_uid: str, b_uid: str) -> str:
+    x, y = (a_uid, b_uid) if a_uid < b_uid else (b_uid, a_uid)
+    raw = f"{x}|{y}|{APP_NAME}|{APP_VERSION}".encode("utf-8")
+    return "t_" + sha256_hex(raw)[:40]
+
+
+def safe_json_loads(s: str, fallback: Any) -> Any:
+    try:
+        return json.loads(s)
+    except Exception:
+        return fallback
+
+
+async def db_connect() -> aiosqlite.Connection:
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    await db.executescript(SCHEMA)
+    await db.commit()
+    return db
+
+
+# ============================================================
+# Rate limiting: simple token bucket persisted per user
+# ============================================================
+
+
+class RateLimiter:
+    def __init__(self, per_minute: int = 20, burst: int = 40):
