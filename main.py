@@ -637,3 +637,74 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors if _cors != [""] else ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(ApiError)
+async def api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status,
+        content={"ok": False, "code": exc.code, "message": exc.message, "details": exc.details},
+    )
+
+
+@app.exception_handler(ValidationError)
+async def validation_handler(_: Request, exc: ValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "code": "request.invalid", "message": "Invalid request", "details": exc.errors()},
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root() -> str:
+    # tiny landing page
+    return f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>{APP_NAME}</title>
+    <style>
+      body{{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;max-width:900px;margin:40px auto;padding:0 16px;}}
+      code{{background:#f3f4f6;padding:2px 6px;border-radius:6px;}}
+      .box{{border:1px solid #e5e7eb;border-radius:14px;padding:16px;}}
+      a{{color:#2563eb;text-decoration:none}}
+      a:hover{{text-decoration:underline}}
+    </style>
+  </head>
+  <body>
+    <h1>{APP_NAME}</h1>
+    <div class="box">
+      <p>Backend is running. Open <code>/docs</code> for API docs.</p>
+      <p>Website UI expects this backend at <code>http://127.0.0.1:8000</code> by default.</p>
+    </div>
+  </body>
+</html>
+""".strip()
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True, "name": APP_NAME, "version": APP_VERSION, "time": unix_ts()}
+
+
+# ============================================================
+# DB context dependency
+# ============================================================
+
+
+async def get_db() -> aiosqlite.Connection:
+    db = await db_connect()
+    try:
+        yield db
+        await db.commit()
+    finally:
+        await db.close()
+
