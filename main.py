@@ -1134,3 +1134,74 @@ async def post_message(
     user: UserCtx = Depends(get_auth_user),
     db: aiosqlite.Connection = Depends(get_db),
 ) -> MessageOut:
+    await RATE.consume(db, user.uid, cost=1)
+    t = await ensure_thread_access(db, user.uid, thread_id)
+
+    text = _sanitize_message_text(body.text)
+    client_msg_id = (body.client_msg_id or "").strip()
+    if len(client_msg_id) > 80:
+        client_msg_id = client_msg_id[:80]
+
+    # Basic client-id dedupe per thread
+    if client_msg_id:
+        row = await db.execute_fetchone(
+            "SELECT seq FROM messages WHERE thread_id=? AND client_msg_id=? AND from_uid=?",
+            (thread_id, client_msg_id, user.uid),
+        )
+        if row is not None:
+            # Return the existing message
+            existing_seq = int(row["seq"])
+            r = await db.execute_fetchone("SELECT * FROM messages WHERE thread_id=? AND seq=?", (thread_id, existing_seq))
+            ensure(r is not None, 500, "message.missing", "Message missing")
+            msg = {
+                "thread_id": thread_id,
+                "seq": int(r["seq"]),
+                "from_uid": r["from_uid"],
+                "text": r["text"],
+                "at": int(r["at"]),
+                "client_msg_id": r["client_msg_id"],
+            }
+            background.add_task(HUB.broadcast, thread_id, {"type": "message", "message": msg, "deduped": True})
+            return MessageOut(message=msg)
+
+    seq = await next_seq(db, thread_id)
+    at = unix_ts()
+    await db.execute(
+        "INSERT INTO messages(thread_id, seq, from_uid, text, at, client_msg_id) VALUES(?,?,?,?,?,?)",
+        (thread_id, seq, user.uid, text, at, client_msg_id),
+    )
+    await db.execute("UPDATE threads SET last_msg_at=? WHERE thread_id=?", (at, thread_id))
+
+    msg = {"thread_id": thread_id, "seq": seq, "from_uid": user.uid, "text": text, "at": at, "client_msg_id": client_msg_id}
+    background.add_task(HUB.broadcast, thread_id, {"type": "message", "message": msg})
+
+    # Friendly bot nudge in DMs (optional): if message asks, include bot suggestion event.
+    if "help me" in text.lower() or "icebreaker" in text.lower():
+        other_uid = t["b_uid"] if user.uid == t["a_uid"] else t["a_uid"]
+        background.add_task(
+            HUB.broadcast,
+            thread_id,
+            {"type": "hint", "hint": await _bot_icebreaker(db, user.uid, other_uid)},
+        )
+
+    return MessageOut(message=msg)
+
+
+# ============================================================
+# WebSocket chat
+# ============================================================
+
+
+async def _ws_auth_uid(ws: WebSocket) -> str:
+    token = ws.query_params.get("token", "").strip()
+    if not token:
+        # allow header too
+        hdr = ws.headers.get("authorization") or ws.headers.get("Authorization") or ""
+        if hdr.startswith("Bearer "):
+            token = hdr[len("Bearer ") :].strip()
+    if not token:
+        raise ApiError(401, "auth.missing", "Missing token")
+    claims = verify_token(token)
+    return claims.uid
+
+
