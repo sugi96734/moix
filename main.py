@@ -1205,3 +1205,74 @@ async def _ws_auth_uid(ws: WebSocket) -> str:
     return claims.uid
 
 
+@app.websocket("/ws/chat/{thread_id}")
+async def ws_chat(ws: WebSocket, thread_id: str) -> None:
+    await ws.accept()
+    conn: Optional[WsConn] = None
+    db: Optional[aiosqlite.Connection] = None
+    try:
+        uid = await _ws_auth_uid(ws)
+        db = await db_connect()
+        await ensure_thread_access(db, uid, thread_id)
+
+        conn = WsConn(uid=uid, thread_id=thread_id, ws=ws, connected_at=unix_ts(), last_seen_at=unix_ts())
+        await HUB.add(conn)
+        await ws.send_text(json.dumps({"type": "ready", "thread_id": thread_id, "uid": uid}, separators=(",", ":")))
+
+        while True:
+            raw = await ws.receive_text()
+            conn.last_seen_at = unix_ts()
+            # client can send pings or typing hints
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                await ws.send_text(json.dumps({"type": "error", "code": "ws.bad_json"}, separators=(",", ":")))
+                continue
+            t = str(obj.get("type", "")).strip().lower()
+            if t == "ping":
+                await ws.send_text(json.dumps({"type": "pong", "t": unix_ts()}, separators=(",", ":")))
+            elif t == "typing":
+                await HUB.broadcast(thread_id, {"type": "typing", "uid": uid, "at": unix_ts()})
+            elif t == "seen":
+                await HUB.broadcast(thread_id, {"type": "seen", "uid": uid, "at": unix_ts()})
+            else:
+                await ws.send_text(json.dumps({"type": "error", "code": "ws.unknown_type"}, separators=(",", ":")))
+    except WebSocketDisconnect:
+        pass
+    except ApiError as e:
+        try:
+            await ws.send_text(json.dumps({"type": "error", "code": e.code, "message": e.message}, separators=(",", ":")))
+        except Exception:
+            pass
+    except HTTPException as e:
+        try:
+            await ws.send_text(json.dumps({"type": "error", "code": "http", "message": str(e.detail)}, separators=(",", ":")))
+        except Exception:
+            pass
+    finally:
+        if conn is not None:
+            await HUB.remove(conn)
+        if db is not None:
+            await db.close()
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Bot: friendly chat + icebreakers + friend-finder tips
+# ============================================================
+
+
+def _soft_classify(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["match", "matches", "who likes me", "liked me", "swipe", "like back"]):
+        return "matching"
+    if any(k in t for k in ["profile", "bio", "avatar", "tag", "tags", "settings"]):
+        return "profile"
+    if any(k in t for k in ["icebreaker", "starter", "first message", "opening line"]):
+        return "icebreaker"
+    if any(k in t for k in ["report", "block", "harass", "abuse", "spam"]):
+        return "safety"
+    if any(k in t for k in ["recommend", "discover", "find friends", "people like"]):
