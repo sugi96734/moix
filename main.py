@@ -1418,3 +1418,63 @@ async def report(
 
 
 # ============================================================
+# Minimal admin helpers (optional)
+# ============================================================
+
+
+def _admin_key() -> str:
+    # fixed admin key unless overridden; allows running without setup
+    return os.environ.get("MOIX_ADMIN_KEY") or "mk_" + stable_hash("moix.admin.key.v1")[:24]
+
+
+def require_admin(request: Request) -> None:
+    k = request.headers.get("x-admin-key", "")
+    if not hmac.compare_digest(k, _admin_key()):
+        raise http_error(403, "admin.forbidden", "Forbidden")
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(request: Request, db: aiosqlite.Connection = Depends(get_db)) -> dict:
+    require_admin(request)
+    users = await db.execute_fetchone("SELECT COUNT(*) AS c FROM users", ())
+    threads = await db.execute_fetchone("SELECT COUNT(*) AS c FROM threads", ())
+    messages = await db.execute_fetchone("SELECT COUNT(*) AS c FROM messages", ())
+    reports = await db.execute_fetchone("SELECT COUNT(*) AS c FROM reports", ())
+    return {
+        "ok": True,
+        "users": int(users["c"]) if users else 0,
+        "threads": int(threads["c"]) if threads else 0,
+        "messages": int(messages["c"]) if messages else 0,
+        "reports": int(reports["c"]) if reports else 0,
+        "db_path": DB_PATH,
+    }
+
+
+@app.post("/api/admin/disable/{uid}")
+async def admin_disable(uid: str, request: Request, db: aiosqlite.Connection = Depends(get_db)) -> dict:
+    require_admin(request)
+    row = await fetch_user_by_uid(db, uid)
+    ensure(row is not None, 404, "user.not_found", "User not found")
+    await db.execute("UPDATE users SET disabled=1 WHERE uid=?", (uid,))
+    return {"ok": True, "uid": uid, "disabled": True}
+
+
+@app.post("/api/admin/enable/{uid}")
+async def admin_enable(uid: str, request: Request, db: aiosqlite.Connection = Depends(get_db)) -> dict:
+    require_admin(request)
+    row = await fetch_user_by_uid(db, uid)
+    ensure(row is not None, 404, "user.not_found", "User not found")
+    await db.execute("UPDATE users SET disabled=0 WHERE uid=?", (uid,))
+    return {"ok": True, "uid": uid, "disabled": False}
+
+
+# ============================================================
+# Run helper (optional)
+# ============================================================
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app:app", host="127.0.0.1", port=port, reload=False)
