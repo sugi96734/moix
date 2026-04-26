@@ -1347,3 +1347,74 @@ def _bot_reply(kind: str, vibe: str, text: str) -> Tuple[str, Dict[str, Any]]:
                 "Then mirror their answer with a follow-up.",
                 meta,
             )
+        return (
+            "Pick something from their profile and ask a small, answerable question. "
+            "If you’re stuck: “What’s a tiny thing that made your week better?”",
+            meta,
+        )
+
+    if kind == "safety":
+        return (
+            "If someone’s being weird: block first, then report if needed. You don’t owe anyone a debate. "
+            "If you want, paste a short note and I’ll help you phrase a calm boundary message.",
+            meta,
+        )
+
+    if kind == "discover":
+        return (
+            "Discovery tip: your tags are your magnet. Add tags that imply stories (e.g., “bouldering”, “afrobeat”, “meal prep”). "
+            "Then like people whose tags overlap — it improves conversation quality.",
+            meta,
+        )
+
+    # default chat
+    if tone == "direct":
+        return ("Tell me what you’re trying to do: find friends, get more matches, or write a first message — and I’ll be specific.", meta)
+    if tone == "witty":
+        return ("I’m your tiny wing-bot. Give me a situation and I’ll give you a line that doesn’t sound like a line.", meta)
+    return ("I’m here. Want help with your profile, discovery, or messaging someone you matched with?", meta)
+
+
+@app.post("/api/bot/chat", response_model=BotChatOut)
+async def bot_chat(
+    body: BotChatIn,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> BotChatOut:
+    await RATE.consume(db, user.uid, cost=1)
+    kind = _soft_classify(body.text)
+    reply, meta = _bot_reply(kind, body.vibe, body.text)
+    # add small personalization
+    me = await to_public_profile(db, user.uid)
+    if kind in {"chat", "discover"} and me.tags:
+        meta["you_tags"] = me.tags[:6]
+    return BotChatOut(reply=reply, meta=meta)
+
+
+# ============================================================
+# Reports
+# ============================================================
+
+
+@app.post("/api/report", response_model=ReportOut)
+async def report(
+    body: ReportIn,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> ReportOut:
+    await RATE.consume(db, user.uid, cost=2)
+    ensure(await fetch_user_by_uid(db, body.accused_uid) is not None, 404, "user.not_found", "Accused user not found")
+    reason = body.reason.strip().lower()
+    note = (body.note or "").strip()
+    if len(note) > 64:
+        note = note[:64]
+    at = unix_ts()
+    cur = await db.execute(
+        "INSERT INTO reports(reporter_uid, accused_uid, reason, note, at) VALUES(?,?,?,?,?)",
+        (user.uid, body.accused_uid, reason, note, at),
+    )
+    rid = int(cur.lastrowid or 0)
+    return ReportOut(report_id=rid)
+
+
+# ============================================================
