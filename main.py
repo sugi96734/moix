@@ -1063,3 +1063,74 @@ async def ensure_thread_access(db: aiosqlite.Connection, uid: str, thread_id: st
     ensure(uid in (t["a_uid"], t["b_uid"]), 403, "thread.forbidden", "No access to thread")
     other = t["b_uid"] if uid == t["a_uid"] else t["a_uid"]
     ensure(await is_match(db, uid, other), 403, "thread.not_matched", "Not matched")
+    return t
+
+
+async def next_seq(db: aiosqlite.Connection, thread_id: str) -> int:
+    row = await db.execute_fetchone("SELECT MAX(seq) AS m FROM messages WHERE thread_id=?", (thread_id,))
+    m = row["m"] if row and row["m"] is not None else 0
+    return int(m) + 1
+
+
+@app.get("/api/threads/{thread_id}/messages", response_model=ThreadMessagesOut)
+async def get_messages(
+    thread_id: str,
+    limit: int = 60,
+    before_seq: int = 0,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> ThreadMessagesOut:
+    await RATE.consume(db, user.uid, cost=1)
+    await ensure_thread_access(db, user.uid, thread_id)
+    limit = clamp_int(limit, 1, 200)
+
+    if before_seq <= 0:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE thread_id=? ORDER BY seq DESC LIMIT ?",
+            (thread_id, limit),
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE thread_id=? AND seq < ? ORDER BY seq DESC LIMIT ?",
+            (thread_id, before_seq, limit),
+        )
+    msgs = []
+    for r in reversed(rows):
+        msgs.append(
+            {
+                "thread_id": thread_id,
+                "seq": int(r["seq"]),
+                "from_uid": r["from_uid"],
+                "text": r["text"],
+                "at": int(r["at"]),
+                "client_msg_id": r["client_msg_id"],
+            }
+        )
+    return ThreadMessagesOut(thread_id=thread_id, messages=msgs)
+
+
+def _sanitize_message_text(text: str) -> str:
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    t = t.strip()
+    if not t:
+        raise http_error(400, "message.empty", "Message empty")
+    if len(t) > 2000:
+        raise http_error(400, "message.too_long", "Message too long")
+    # avoid hidden control characters
+    cleaned = []
+    for ch in t:
+        o = ord(ch)
+        if o < 32 and ch not in ("\n", "\t"):
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned)
+
+
+@app.post("/api/threads/{thread_id}/messages", response_model=MessageOut)
+async def post_message(
+    thread_id: str,
+    body: MessageIn,
+    background: BackgroundTasks,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> MessageOut:
