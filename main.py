@@ -850,3 +850,74 @@ async def update_me(
     prefs = body.prefs if body.prefs is not None else safe_json_loads(p["prefs_json"], {})
     tags = body.tags if body.tags is not None else safe_json_loads(p["tags_json"], [])
     settings = body.settings if body.settings is not None else safe_json_loads(p["settings_json"], {})
+    email_hint = body.email_hint if body.email_hint is not None else p["email_hint"]
+
+    if not isinstance(prefs, dict):
+        prefs = {}
+    if not isinstance(tags, list):
+        tags = []
+    if not isinstance(settings, dict):
+        settings = {}
+    # compact any large setting values
+    if len(json.dumps(settings, ensure_ascii=False)) > 6000:
+        raise http_error(400, "settings.too_large", "Settings too large")
+
+    now = unix_ts()
+    await RATE.consume(db, user.uid, cost=2)
+    await db.execute(
+        "UPDATE profiles SET bio=?, avatar=?, country=?, age=?, prefs_json=?, tags_json=?, settings_json=?, email_hint=?, updated_at=? WHERE uid=?",
+        (
+            bio,
+            avatar,
+            country,
+            int(age),
+            json.dumps(prefs, separators=(",", ":"), ensure_ascii=False),
+            json.dumps(tags, separators=(",", ":"), ensure_ascii=False),
+            json.dumps(settings, separators=(",", ":"), ensure_ascii=False),
+            email_hint,
+            now,
+            user.uid,
+        ),
+    )
+    pub = await to_public_profile(db, user.uid)
+    return ProfileMe(**pub.model_dump(), email_hint=email_hint, settings=settings)
+
+
+# ============================================================
+# Browse / likes / matches
+# ============================================================
+
+
+async def set_edge(db: aiosqlite.Connection, src: str, dst: str, kind: str, value: int) -> None:
+    now = unix_ts()
+    await db.execute(
+        "INSERT INTO edges(src_uid, dst_uid, kind, value, updated_at) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(src_uid, dst_uid, kind) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (src, dst, kind, int(value), now),
+    )
+
+
+async def get_edge(db: aiosqlite.Connection, src: str, dst: str, kind: str) -> int:
+    row = await db.execute_fetchone("SELECT value FROM edges WHERE src_uid=? AND dst_uid=? AND kind=?", (src, dst, kind))
+    if row is None:
+        return 0
+    return int(row["value"])
+
+
+async def ensure_can_interact(db: aiosqlite.Connection, src: str, dst: str) -> None:
+    ensure(src != dst, 400, "edge.self", "Cannot target self")
+    ensure(await fetch_user_by_uid(db, dst) is not None, 404, "user.not_found", "Target not found")
+    b1 = await get_edge(db, src, dst, "block")
+    b2 = await get_edge(db, dst, src, "block")
+    ensure(b1 == 0 and b2 == 0, 403, "edge.blocked", "Blocked")
+
+
+async def ensure_thread(db: aiosqlite.Connection, a_uid: str, b_uid: str) -> str:
+    tid = deterministic_thread_id(a_uid, b_uid)
+    row = await db.execute_fetchone("SELECT thread_id FROM threads WHERE thread_id=?", (tid,))
+    if row is None:
+        now = unix_ts()
+        x, y = (a_uid, b_uid) if a_uid < b_uid else (b_uid, a_uid)
+        await db.execute(
+            "INSERT INTO threads(thread_id, a_uid, b_uid, created_at, last_msg_at, meta_json) VALUES(?,?,?,?,?,?)",
+            (tid, x, y, now, 0, "{}"),
