@@ -1276,3 +1276,74 @@ def _soft_classify(text: str) -> str:
     if any(k in t for k in ["report", "block", "harass", "abuse", "spam"]):
         return "safety"
     if any(k in t for k in ["recommend", "discover", "find friends", "people like"]):
+        return "discover"
+    return "chat"
+
+
+def _tone(vibe: str) -> str:
+    v = (vibe or "").strip().lower()
+    if v in {"chill", "calm"}:
+        return "chill"
+    if v in {"direct", "straight"}:
+        return "direct"
+    if v in {"funny", "witty"}:
+        return "witty"
+    return "friendly"
+
+
+async def _bot_icebreaker(db: aiosqlite.Connection, me_uid: str, other_uid: str) -> str:
+    me = await to_public_profile(db, me_uid)
+    other = await to_public_profile(db, other_uid)
+    shared = sorted(set(me.tags).intersection(other.tags))[:3]
+    if shared:
+        return f"Try: “Hey! I saw you’re into {', '.join(shared)} — what got you into that?”"
+    if other.bio:
+        snippet = other.bio.strip().split("\n")[0][:60]
+        return f"Try: “Your bio line ‘{snippet}’ caught my eye — tell me more?”"
+    return "Try: “What’s something you’ve been obsessed with lately?”"
+
+
+def _bot_reply(kind: str, vibe: str, text: str) -> Tuple[str, Dict[str, Any]]:
+    tone = _tone(vibe)
+    meta = {"kind": kind, "tone": tone}
+    t = text.strip()
+
+    if kind == "matching":
+        if tone == "direct":
+            return (
+                "Matches happen when you and another person both hit Like. If you want quicker matches: "
+                "use 5–8 clear tags, keep your bio specific, and like intentionally (not everyone).",
+                meta,
+            )
+        return (
+            "If two people like each other, you’ll see a match and unlock a chat thread. "
+            "Quick boost: add a couple of tags that really describe your vibe and ask one specific question in your bio.",
+            meta,
+        )
+
+    if kind == "profile":
+        if tone == "witty":
+            return (
+                "Think of your profile like a movie trailer: 2–3 specifics, 0 spoilers, and one line that invites a reply. "
+                "Tags should be “real you” tags — not “what you think people want.”",
+                meta,
+            )
+        return (
+            "Best profiles are easy to respond to: one concrete interest, one preference, and one open question. "
+            "Keep tags focused (like 6–10).",
+            meta,
+        )
+
+    if kind == "icebreaker":
+        if tone == "direct":
+            return (
+                "Use a single question + a reason. Example: “You mentioned hiking — favorite trail and why?” "
+                "Avoid one-word openers; they stall.",
+                meta,
+            )
+        if tone == "witty":
+            return (
+                "Icebreaker recipe: playful constraint + easy answer. Example: “Two snacks for a road trip: what’s your duo?” "
+                "Then mirror their answer with a follow-up.",
+                meta,
+            )
