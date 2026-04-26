@@ -992,3 +992,74 @@ async def browse(
 @app.post("/api/block", response_model=Ok)
 async def set_block(
     body: LikeIn,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> Ok:
+    await RATE.consume(db, user.uid, cost=1)
+    await ensure_can_interact(db, user.uid, body.target_uid)
+    await set_edge(db, user.uid, body.target_uid, "block", 1 if body.like else 0)
+    # When blocking, clear likes in both directions for cleanliness
+    if body.like:
+        await set_edge(db, user.uid, body.target_uid, "like", 0)
+        await set_edge(db, body.target_uid, user.uid, "like", 0)
+    return Ok()
+
+
+@app.post("/api/like", response_model=LikeOut)
+async def set_like(
+    body: LikeIn,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> LikeOut:
+    await RATE.consume(db, user.uid, cost=1)
+    await ensure_can_interact(db, user.uid, body.target_uid)
+
+    v = 1 if body.like else 0
+    await set_edge(db, user.uid, body.target_uid, "like", v)
+
+    if not body.like:
+        return LikeOut(matched=False, thread_id=None)
+
+    matched = await is_match(db, user.uid, body.target_uid)
+    if matched:
+        tid = await ensure_thread(db, user.uid, body.target_uid)
+        return LikeOut(matched=True, thread_id=tid)
+    return LikeOut(matched=False, thread_id=None)
+
+
+@app.get("/api/matches", response_model=MatchOut)
+async def matches(
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> MatchOut:
+    await RATE.consume(db, user.uid, cost=1)
+
+    # naive approach: scan my likes, then check reciprocal
+    rows = await db.execute_fetchall(
+        "SELECT dst_uid FROM edges WHERE src_uid=? AND kind='like' AND value=1",
+        (user.uid,),
+    )
+    liked_uids = [r["dst_uid"] for r in rows]
+    out: List[Dict[str, Any]] = []
+    for dst in liked_uids[:500]:
+        if await is_match(db, user.uid, dst):
+            tid = deterministic_thread_id(user.uid, dst)
+            prof = await to_public_profile(db, dst)
+            trow = await db.execute_fetchone("SELECT last_msg_at FROM threads WHERE thread_id=?", (tid,))
+            last_msg_at = int(trow["last_msg_at"]) if trow else 0
+            out.append({"thread_id": tid, "user": prof.model_dump(), "last_msg_at": last_msg_at})
+    out.sort(key=lambda x: (-int(x["last_msg_at"]), x["thread_id"]))
+    return MatchOut(matches=out)
+
+
+# ============================================================
+# Threads + messages
+# ============================================================
+
+
+async def ensure_thread_access(db: aiosqlite.Connection, uid: str, thread_id: str) -> aiosqlite.Row:
+    t = await db.execute_fetchone("SELECT * FROM threads WHERE thread_id=?", (thread_id,))
+    ensure(t is not None, 404, "thread.not_found", "Thread not found")
+    ensure(uid in (t["a_uid"], t["b_uid"]), 403, "thread.forbidden", "No access to thread")
+    other = t["b_uid"] if uid == t["a_uid"] else t["a_uid"]
+    ensure(await is_match(db, uid, other), 403, "thread.not_matched", "Not matched")
