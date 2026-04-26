@@ -779,3 +779,74 @@ async def ensure_not_disabled(urow: aiosqlite.Row) -> None:
 async def register(body: RegisterIn, db: aiosqlite.Connection = Depends(get_db)) -> AuthOut:
     handle = body.handle.strip().lower()
     ensure(HANDLE_RE.match(handle) is not None, 400, "handle.invalid", "Invalid handle")
+    salt = new_password_salt()
+    ph = password_hash(body.password, salt)
+
+    exists = await fetch_user_by_handle(db, handle)
+    ensure(exists is None, 409, "handle.taken", "Handle already taken")
+
+    uid = derive_uid(handle)
+    now = unix_ts()
+    await db.execute(
+        "INSERT INTO users(uid, handle, pass_salt, pass_hash, created_at, last_login_at) VALUES(?,?,?,?,?,?)",
+        (uid, handle, salt, ph, now, now),
+    )
+    await db.execute(
+        "INSERT INTO profiles(uid, bio, avatar, country, age, prefs_json, tags_json, settings_json, email_hint, updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (uid, "", "", "", 0, "{}", "[]", "{}", "", now),
+    )
+    token = sign_token(uid)
+    claims = verify_token(token)
+    return AuthOut(token=token, uid=uid, handle=handle, expires_at=claims.exp)
+
+
+@app.post("/api/login", response_model=AuthOut)
+async def login(body: LoginIn, db: aiosqlite.Connection = Depends(get_db)) -> AuthOut:
+    handle = body.handle.strip().lower()
+    u = await fetch_user_by_handle(db, handle)
+    ensure(u is not None, 404, "auth.not_found", "No such account")
+    await ensure_not_disabled(u)
+    want = password_hash(body.password, u["pass_salt"])
+    ensure(hmac.compare_digest(want, u["pass_hash"]), 401, "auth.bad_password", "Wrong password")
+    now = unix_ts()
+    await db.execute("UPDATE users SET last_login_at=? WHERE uid=?", (now, u["uid"]))
+    token = sign_token(u["uid"])
+    claims = verify_token(token)
+    return AuthOut(token=token, uid=u["uid"], handle=u["handle"], expires_at=claims.exp)
+
+
+@app.get("/api/me", response_model=ProfileMe)
+async def me(user: UserCtx = Depends(get_auth_user), db: aiosqlite.Connection = Depends(get_db)) -> ProfileMe:
+    u = await fetch_user_by_uid(db, user.uid)
+    ensure(u is not None, 404, "auth.not_found", "User not found")
+    await ensure_not_disabled(u)
+    p = await fetch_profile_row(db, user.uid)
+    ensure(p is not None, 500, "profile.missing", "Profile missing")
+    pub = await to_public_profile(db, user.uid)
+    return ProfileMe(
+        **pub.model_dump(),
+        email_hint=p["email_hint"],
+        settings=safe_json_loads(p["settings_json"], {}) if p else {},
+    )
+
+
+@app.put("/api/me", response_model=ProfileMe)
+async def update_me(
+    body: ProfileUpdateIn,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> ProfileMe:
+    u = await fetch_user_by_uid(db, user.uid)
+    ensure(u is not None, 404, "auth.not_found", "User not found")
+    await ensure_not_disabled(u)
+    p = await fetch_profile_row(db, user.uid)
+    ensure(p is not None, 500, "profile.missing", "Profile missing")
+
+    bio = body.bio if body.bio is not None else p["bio"]
+    avatar = body.avatar if body.avatar is not None else p["avatar"]
+    country = body.country if body.country is not None else p["country"]
+    age = body.age if body.age is not None else int(p["age"])
+    prefs = body.prefs if body.prefs is not None else safe_json_loads(p["prefs_json"], {})
+    tags = body.tags if body.tags is not None else safe_json_loads(p["tags_json"], [])
+    settings = body.settings if body.settings is not None else safe_json_loads(p["settings_json"], {})
