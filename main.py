@@ -921,3 +921,74 @@ async def ensure_thread(db: aiosqlite.Connection, a_uid: str, b_uid: str) -> str
         await db.execute(
             "INSERT INTO threads(thread_id, a_uid, b_uid, created_at, last_msg_at, meta_json) VALUES(?,?,?,?,?,?)",
             (tid, x, y, now, 0, "{}"),
+        )
+    return tid
+
+
+async def is_match(db: aiosqlite.Connection, a_uid: str, b_uid: str) -> bool:
+    la = await get_edge(db, a_uid, b_uid, "like")
+    lb = await get_edge(db, b_uid, a_uid, "like")
+    if la == 1 and lb == 1:
+        # ensure neither blocked
+        b1 = await get_edge(db, a_uid, b_uid, "block")
+        b2 = await get_edge(db, b_uid, a_uid, "block")
+        return b1 == 0 and b2 == 0
+    return False
+
+
+@app.post("/api/browse", response_model=BrowseOut)
+async def browse(
+    body: BrowseIn,
+    user: UserCtx = Depends(get_auth_user),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> BrowseOut:
+    await RATE.consume(db, user.uid, cost=1)
+
+    seed = body.seed.strip() if body.seed else ""
+    if not seed:
+        seed = secrets.token_hex(12)
+    mode = (body.mode or "discover").strip().lower()
+    limit = clamp_int(body.limit, 1, 60)
+
+    # Collect candidates excluding self and blocked/disabled.
+    rows = await db.execute_fetchall("SELECT uid FROM users WHERE disabled=0 AND uid<>?", (user.uid,))
+    uids = [r["uid"] for r in rows]
+
+    # Remove blocked in either direction quickly using edges
+    # (SQLite is fine for small loads; for large scale you'd add indexes and query joins.)
+    blocked_rows = await db.execute_fetchall(
+        "SELECT dst_uid FROM edges WHERE src_uid=? AND kind='block' AND value=1",
+        (user.uid,),
+    )
+    blocked_set = {r["dst_uid"] for r in blocked_rows}
+    uids = [u for u in uids if u not in blocked_set]
+
+    # deterministic shuffle then score top K window
+    uids = _shuffle_deterministic(uids, seed + "|" + mode + "|" + user.uid)
+    window = uids[: max(120, limit * 4)]
+
+    me_prof = await to_public_profile(db, user.uid)
+    scored: List[Tuple[int, str]] = []
+    for uid in window:
+        other = await to_public_profile(db, uid)
+        if mode == "fresh":
+            # prefer recently updated
+            s = 1 + int(other.updated_at / 3600) % 50
+        elif mode == "quiet":
+            # fewer tags, shorter bio; softer vibes
+            s = 1 + (10 - min(10, len(other.tags))) + (5 if len(other.bio or "") < 60 else 0)
+        else:
+            s = score_pair(me_prof, other)
+        scored.append((s, uid))
+
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    results: List[ProfilePublic] = []
+    for s, uid in scored[:limit]:
+        results.append(await to_public_profile(db, uid))
+
+    return BrowseOut(mode=mode, seed=seed, results=results)
+
+
+@app.post("/api/block", response_model=Ok)
+async def set_block(
+    body: LikeIn,
